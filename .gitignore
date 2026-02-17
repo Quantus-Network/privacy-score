@@ -1,0 +1,8 @@
+# TypeScript
+ts/node_modules/
+ts/dist/
+
+# Dart
+dart/.dart_tool/
+dart/.packages
+dart/pubspec.lock

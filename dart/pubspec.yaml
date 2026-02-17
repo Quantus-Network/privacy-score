@@ -1,0 +1,9 @@
+name: privacy_score
+description: Wormhole privacy score computation for Quantus Network
+version: 1.0.0
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dev_dependencies:
+  test: ^1.24.0

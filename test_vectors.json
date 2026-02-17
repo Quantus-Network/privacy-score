@@ -1,0 +1,55 @@
+[
+  {
+    "description": "Empty pool always returns 0",
+    "outputAmount": 100,
+    "dist": 0,
+    "pool": { "totalDeposits": 0, "sumAmounts": "0", "sumAmountsSquared": "0" },
+    "feeBps": 10,
+    "kMin": 1,
+    "kMax": 16,
+    "expectedScore": 0
+  },
+  {
+    "description": "Single deposit pool with sigma=0 returns 0",
+    "outputAmount": 100,
+    "dist": 0,
+    "pool": { "totalDeposits": 1, "sumAmounts": "500", "sumAmountsSquared": "250000" },
+    "feeBps": 10,
+    "kMin": 1,
+    "kMax": 16,
+    "expectedScore": 0
+  },
+  {
+    "description": "Large output with small deposits should have low score",
+    "outputAmount": 100000,
+    "dist": 0,
+    "pool": { "totalDeposits": 100, "sumAmounts": "1000", "sumAmountsSquared": "14000" },
+    "feeBps": 10,
+    "kMin": 1,
+    "kMax": 16,
+    "expectedScoreBelow": 1
+  },
+  {
+    "description": "Small output with large pool should have high score",
+    "outputAmount": 10,
+    "dist": 0,
+    "pool": { "totalDeposits": 1000, "sumAmounts": "500000", "sumAmountsSquared": "350000000" },
+    "feeBps": 10,
+    "kMin": 1,
+    "kMax": 16,
+    "expectedScoreAbove": 5
+  },
+  {
+    "description": "Adding dist should increase or maintain score",
+    "outputAmount": 500,
+    "dist": 100,
+    "pool": { "totalDeposits": 500, "sumAmounts": "250000", "sumAmountsSquared": "200000000" },
+    "feeBps": 10,
+    "kMin": 1,
+    "kMax": 16,
+    "compareWith": {
+      "dist": 0,
+      "relation": "greaterThanOrEqual"
+    }
+  }
+]
