@@ -5,97 +5,122 @@
  * current deposit pool statistics. The score is log2 of the estimated
  * number of deposit subsets that could have produced the observed output.
  *
- * Algorithm:
- *   1. Compute the pre-fee input range [input_lo, input_hi] from the output amount and dist
- *   2. For each subset size k in [k_min, k_max]:
- *      - Use CLT to estimate P(sum of k random deposits falls in the input range)
- *      - Multiply by C(D, k) to get estimated valid subsets of size k
- *   3. Sum across all k values and take log2
+ * Uses bucketed pool statistics to handle skewed deposit distributions
+ * (e.g., many small miner rewards + few large transfers).
+ *
+ * Bucket ranges are bounded [lo, hi) with overlapping ranges growing by factor 4:
+ *   [0, 1 DEV), [1, 16), [4, 64), [16, 256), [64, 1024), ...
+ *
+ * For a target T with k deposits, we need deposits averaging ~T/k.
+ * We select the bucket whose range contains T/k_max, ensuring the CLT
+ * approximation uses only deposits of the right order of magnitude.
  */
 
+const UNIT = 1_000_000_000_000; // 1 DEV in planck
+
 /**
- * Aggregate statistics of the wormhole deposit pool.
- *
- * Maintained incrementally as deposits arrive and accounts are removed.
- * Only three values are needed for the privacy score computation.
+ * A single bucket of deposit pool statistics.
  */
-export interface DepositPoolStats {
-  /** Total number of unconsumed wormhole deposits */
-  totalDeposits: number;
-  /** Sum of all deposit amounts (quantized) */
+export interface PoolBucket {
+  /** Lower bound (inclusive) in planck */
+  lo: number;
+  /** Upper bound (exclusive) in planck, Infinity for top bucket */
+  hi: number;
+  /** Number of deposits in this range */
+  count: number;
+  /** Sum of deposit amounts in this range */
   sumAmounts: bigint;
-  /** Sum of squared deposit amounts (for variance computation) */
+  /** Sum of squared deposit amounts in this range */
   sumAmountsSquared: bigint;
 }
 
 /**
- * Result of a privacy score computation at a specific dist value.
+ * Bucketed deposit pool statistics.
+ */
+export interface DepositPoolStats {
+  buckets: PoolBucket[];
+}
+
+/**
+ * Result of a privacy score computation.
  */
 export interface PrivacyScoreResult {
-  /** The amount reduction (sacrifice) for privacy */
   dist: number;
-  /** Privacy score in bits (log2 of anonymity set size) */
   scoreBits: number;
-  /** Human-readable label */
   label: string;
 }
 
 /**
- * Create an empty deposit pool.
+ * Define the standard bucket boundaries.
+ *
+ * Buckets: [0, 1 DEV), then [2^i, 2^i * 16) DEV for i = 0, 1, 2, ...
+ * Each bucket has width factor 16 (matching k_max).
+ * With base 2, any target has ~4 overlapping buckets for fine-grained selection.
+ */
+export function standardBucketBoundaries(): Array<{ lo: number; hi: number }> {
+  const boundaries: Array<{ lo: number; hi: number }> = [];
+
+  // Bucket 0: [0, 1 DEV) -- sub-DEV deposits (miner rewards etc.)
+  boundaries.push({ lo: 0, hi: 1 * UNIT });
+
+  // Overlapping buckets: [2^i, 2^i * 16) DEV for i = 0, 1, 2, ...
+  for (let i = 0; i < 12; i++) {
+    const lo = Math.pow(2, i) * UNIT;
+    const hi = Math.pow(2, i) * 16 * UNIT;
+    boundaries.push({ lo, hi });
+  }
+
+  return boundaries;
+}
+
+/**
+ * Create an empty deposit pool with standard buckets.
  */
 export function createPool(): DepositPoolStats {
+  const boundaries = standardBucketBoundaries();
   return {
-    totalDeposits: 0,
-    sumAmounts: 0n,
-    sumAmountsSquared: 0n,
+    buckets: boundaries.map(({ lo, hi }) => ({
+      lo,
+      hi,
+      count: 0,
+      sumAmounts: 0n,
+      sumAmountsSquared: 0n,
+    })),
   };
 }
 
 /**
- * Add a deposit to the pool stats.
+ * Add a deposit to the pool. The deposit is added to ALL buckets whose range contains the amount.
  */
 export function addDeposit(pool: DepositPoolStats, amount: bigint): void {
-  pool.totalDeposits += 1;
-  pool.sumAmounts += amount;
-  pool.sumAmountsSquared += amount * amount;
+  const amountNum = Number(amount);
+  for (const bucket of pool.buckets) {
+    if (amountNum >= bucket.lo && amountNum < bucket.hi) {
+      bucket.count += 1;
+      bucket.sumAmounts += amount;
+      bucket.sumAmountsSquared += amount * amount;
+    }
+  }
 }
 
 /**
- * Remove a deposit from the pool stats (e.g., account made a non-wormhole outgoing tx).
+ * Remove a deposit from the pool.
  */
 export function removeDeposit(pool: DepositPoolStats, amount: bigint): void {
-  pool.totalDeposits = Math.max(0, pool.totalDeposits - 1);
-  pool.sumAmounts -= amount;
-  pool.sumAmountsSquared -= amount * amount;
-  // Clamp to zero in case of floating point drift
-  if (pool.sumAmounts < 0n) pool.sumAmounts = 0n;
-  if (pool.sumAmountsSquared < 0n) pool.sumAmountsSquared = 0n;
-}
-
-/**
- * Compute the mean deposit amount.
- */
-export function poolMean(pool: DepositPoolStats): number {
-  if (pool.totalDeposits === 0) return 0;
-  return Number(pool.sumAmounts) / pool.totalDeposits;
-}
-
-/**
- * Compute the standard deviation of deposit amounts.
- */
-export function poolStddev(pool: DepositPoolStats): number {
-  if (pool.totalDeposits < 2) return 0;
-  const n = pool.totalDeposits;
-  const mean = Number(pool.sumAmounts) / n;
-  // variance = E[X^2] - E[X]^2
-  const meanSq = Number(pool.sumAmountsSquared) / n;
-  const variance = meanSq - mean * mean;
-  return Math.sqrt(Math.max(0, variance));
+  const amountNum = Number(amount);
+  for (const bucket of pool.buckets) {
+    if (amountNum >= bucket.lo && amountNum < bucket.hi) {
+      bucket.count = Math.max(0, bucket.count - 1);
+      bucket.sumAmounts -= amount;
+      bucket.sumAmountsSquared -= amount * amount;
+      if (bucket.sumAmounts < 0n) bucket.sumAmounts = 0n;
+      if (bucket.sumAmountsSquared < 0n) bucket.sumAmountsSquared = 0n;
+    }
+  }
 }
 
 /**
  * Standard normal CDF approximation (Abramowitz & Stegun 26.2.17).
- * Accurate to ~1.5e-7.
  */
 export function normalCdf(z: number): number {
   if (z < -8) return 0;
@@ -117,17 +142,14 @@ export function normalCdf(z: number): number {
 }
 
 /**
- * Compute log2(C(n, k)) using log-gamma (Stirling approximation for large n).
- * Returns 0 if k > n or k < 0.
+ * Compute log2(C(n, k)) iteratively without overflow.
  */
 export function log2Binomial(n: number, k: number): number {
   if (k < 0 || k > n) return 0;
   if (k === 0 || k === n) return 0;
 
-  // Use log-gamma: log(C(n,k)) = lgamma(n+1) - lgamma(k+1) - lgamma(n-k+1)
-  let result = 0;
-  // Use the smaller of k and n-k for efficiency
   const kk = Math.min(k, n - k);
+  let result = 0;
   for (let i = 0; i < kk; i++) {
     result += Math.log2(n - i) - Math.log2(i + 1);
   }
@@ -135,16 +157,52 @@ export function log2Binomial(n: number, k: number): number {
 }
 
 /**
+ * Select the best bucket for a given target amount.
+ *
+ * We choose the bucket that contains the target and where the target
+ * is closest to the top of the bucket's range. This ensures:
+ * - Deposits in the bucket are not larger than the target (no subtracting)
+ * - Multiple deposits from the bucket can plausibly sum to the target
+ * - The bucket with the tightest fit is preferred
+ */
+export function selectBucket(
+  pool: DepositPoolStats,
+  target: number,
+): PoolBucket | null {
+  let best: PoolBucket | null = null;
+  let bestHeadroom = Infinity;
+
+  for (const bucket of pool.buckets) {
+    if (bucket.count === 0) continue;
+    // Target must be within the bucket's achievable sum range:
+    // lo <= target (at least one deposit could be <= target)
+    // target < hi * 16 (k_max deposits from this bucket could reach target)
+    if (target >= bucket.lo && target < bucket.hi) {
+      // Headroom = how far target is from the top of the bucket
+      const headroom = bucket.hi - target;
+      if (headroom < bestHeadroom) {
+        best = bucket;
+        bestHeadroom = headroom;
+      }
+    }
+  }
+
+  return best;
+}
+
+/**
  * Compute the privacy score for a wormhole output.
  *
- * @param outputAmount - The quantized output amount observed on-chain
- * @param dist - Amount reduction (sacrifice) for privacy. The actual input could be
- *               anywhere in [outputAmount + fee, outputAmount + fee + dist].
- * @param pool - Current deposit pool statistics
- * @param feeBps - Volume fee in basis points (e.g., 10 = 0.1%)
- * @param kMin - Minimum subset size (typically ceil(numOutputs / 2))
- * @param kMax - Maximum subset size (batch size, e.g., 16)
- * @returns Privacy score in bits (log2 of estimated anonymity set size)
+ * Selects a single bucket of deposits at the right order of magnitude,
+ * then uses CLT across all k values within that bucket.
+ *
+ * @param outputAmount - Total output amount in planck
+ * @param dist - Amount sacrifice for privacy (planck)
+ * @param pool - Bucketed deposit pool statistics
+ * @param feeBps - Volume fee in basis points (e.g., 10)
+ * @param kMin - Minimum subset size
+ * @param kMax - Maximum subset size (batch size)
+ * @returns Privacy score in bits
  */
 export function privacyScore(
   outputAmount: number,
@@ -154,29 +212,29 @@ export function privacyScore(
   kMin: number,
   kMax: number
 ): number {
-  const D = pool.totalDeposits;
-  if (D === 0) return 0;
-
-  const mu = poolMean(pool);
-  const sigma = poolStddev(pool);
-  if (sigma === 0) return 0;
-
-  // Pre-fee input range: output / (1 - fee) to (output + dist) / (1 - fee)
+  // Pre-fee input range
   const feeMultiplier = 10000 / (10000 - feeBps);
   const inputLo = outputAmount * feeMultiplier;
   const inputHi = (outputAmount + dist) * feeMultiplier;
 
+  const bucket = selectBucket(pool, inputLo);
+  if (!bucket || bucket.count === 0) return 0;
+
+  const D = bucket.count;
+  const mu = Number(bucket.sumAmounts) / D;
+  const meanSq = Number(bucket.sumAmountsSquared) / D;
+  const variance = meanSq - mu * mu;
+  const sigma = Math.sqrt(Math.max(0, variance));
+
+  if (sigma === 0) return 0;
+
   const effectiveKMax = Math.min(kMax, D);
   if (kMin > effectiveKMax) return 0;
 
-  // Sum valid subsets across all k values.
-  // For each k, estimate: C(D, k) * P(sum of k deposits in [inputLo, inputHi])
-  // We work in log2 space to avoid overflow, then use log-sum-exp to combine.
   let maxLogTerm = -Infinity;
   const logTerms: number[] = [];
 
   for (let k = kMin; k <= effectiveKMax; k++) {
-    // CLT: sum of k deposits ~ Normal(k*mu, k*sigma^2)
     const sumMean = k * mu;
     const sumStd = sigma * Math.sqrt(k);
 
@@ -186,7 +244,6 @@ export function privacyScore(
 
     if (pK <= 0) continue;
 
-    // log2(C(D,k) * pK) = log2(C(D,k)) + log2(pK)
     const logBinom = log2Binomial(D, k);
     const logP = Math.log2(pK);
     const logTerm = logBinom + logP;
@@ -197,26 +254,17 @@ export function privacyScore(
 
   if (logTerms.length === 0) return 0;
 
-  // log-sum-exp in base 2: log2(sum(2^logTerms))
-  // = maxLogTerm + log2(sum(2^(logTerms - maxLogTerm)))
+  // log-sum-exp in base 2
   let sumExp = 0;
   for (const lt of logTerms) {
     sumExp += Math.pow(2, lt - maxLogTerm);
   }
 
-  return maxLogTerm + Math.log2(sumExp);
+  return Math.max(0, maxLogTerm + Math.log2(sumExp));
 }
 
 /**
- * Compute privacy scores at multiple dist levels for display.
- *
- * @param outputAmount - The quantized output amount
- * @param pool - Current deposit pool statistics
- * @param feeBps - Volume fee in basis points
- * @param kMin - Minimum subset size
- * @param kMax - Maximum subset size (batch size)
- * @param distFractions - Fractions of outputAmount to use as dist values (default: [0, 0.001, 0.01, 0.05])
- * @returns Array of privacy score results at each dist level
+ * Compute privacy scores at multiple dist levels.
  */
 export function privacyScoreTable(
   outputAmount: number,
@@ -238,18 +286,7 @@ export function privacyScoreTable(
 }
 
 /**
- * Find the minimum dist (amount sacrifice) needed to achieve a target privacy score.
- *
- * Uses binary search over dist values.
- *
- * @param outputAmount - The quantized output amount
- * @param pool - Current deposit pool statistics
- * @param feeBps - Volume fee in basis points
- * @param kMin - Minimum subset size
- * @param kMax - Maximum subset size
- * @param targetBits - Target privacy score in bits (e.g., 40)
- * @param maxDistFraction - Maximum fraction of output to sacrifice (default: 0.1 = 10%)
- * @returns The minimum dist value, or null if target is unreachable
+ * Find the minimum dist needed to achieve a target privacy score.
  */
 export function findMinDist(
   outputAmount: number,
@@ -262,17 +299,14 @@ export function findMinDist(
 ): number | null {
   const maxDist = Math.floor(outputAmount * maxDistFraction);
 
-  // Check if target is achievable at max dist
   if (privacyScore(outputAmount, maxDist, pool, feeBps, kMin, kMax) < targetBits) {
     return null;
   }
 
-  // Check if already achieved at dist=0
   if (privacyScore(outputAmount, 0, pool, feeBps, kMin, kMax) >= targetBits) {
     return 0;
   }
 
-  // Binary search
   let lo = 0;
   let hi = maxDist;
   while (hi - lo > 1) {
@@ -296,4 +330,37 @@ export function scoreLabel(bits: number): string {
   if (bits < 40) return "Moderate";
   if (bits < 60) return "Strong";
   return "Very Strong";
+}
+
+/**
+ * Serialize pool stats to JSON (for storage/API).
+ */
+export function poolToJson(pool: DepositPoolStats): string {
+  return JSON.stringify(
+    pool.buckets.map((b) => ({
+      lo: b.lo,
+      hi: b.hi,
+      count: b.count,
+      sumAmounts: b.sumAmounts.toString(),
+      sumAmountsSquared: b.sumAmountsSquared.toString(),
+    }))
+  );
+}
+
+/**
+ * Deserialize pool stats from JSON.
+ */
+export function poolFromJson(json: string): DepositPoolStats {
+  const buckets = JSON.parse(json);
+  return {
+    buckets: buckets.map(
+      (b: { lo: number; hi: number; count: number; sumAmounts: string; sumAmountsSquared: string }) => ({
+        lo: b.lo,
+        hi: b.hi,
+        count: b.count,
+        sumAmounts: BigInt(b.sumAmounts),
+        sumAmountsSquared: BigInt(b.sumAmountsSquared),
+      })
+    ),
+  };
 }
